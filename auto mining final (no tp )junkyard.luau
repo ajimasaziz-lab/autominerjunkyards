@@ -14,6 +14,7 @@
 --      5. Nyangkut -> lompat (Space) -> hitung ulang rute (maks MAX_REPATH kali).
 --      6. Kalau tidak ada rute yang bisa dicapai -> ore itu di-skip, lanjut ke target berikutnya.
 --  * Auto respawn: kalau mati, tunggu tombol Respawn aktif -> klik -> lanjut mining lagi.
+--  * Bertahan saat disconnect: pengaturan disimpan ke file, auto START lagi, auto rejoin + muat ulang script.
 -- Tombol UI atau 0 = start/stop | X = mark + skip SP ini | End = matikan script
 
 local Players = game:GetService("Players")
@@ -23,6 +24,8 @@ local CoreGui = game:GetService("CoreGui")
 local RunService = game:GetService("RunService")
 local PathfindingService = game:GetService("PathfindingService")
 local GuiService = game:GetService("GuiService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
 local player = Players.LocalPlayer
 
@@ -60,6 +63,8 @@ local PROMPT_MARGIN = 2.5       -- berdiri minimal sedekat (jarak aktif tombol M
 local MIN_REACH = 2             -- jarak terdekat yang dicoba saat mendekat lagi (stud)
 local MAX_CLOSER = 3            -- maks berapa kali mendekat lagi kalau tombol Mine belum muncul
 local GROUND_SCAN = 150         -- jarak raycast ke bawah untuk cari tanah (stud)
+local KEY_FALLBACK_AFTER = 0.8  -- WASD tidak menggerakkan karakter selama ini (dtk) -> pakai MoveTo sebagai cadangan
+local KEY_RESEND = 0.4           -- kirim ulang tombol yang sedang ditahan tiap sekian detik (jaga-jaga event hilang)
 local CAMERA_FOLLOW = true      -- saat berjalan, kamera diputar halus ke arah tujuan
 local CAMERA_TURN_SPEED = 4     -- kehalusan putar kamera (makin besar = makin cepat menyusul)
 local CAMERA_MAX_TURN = 160     -- batas kecepatan putar kamera (derajat/detik)
@@ -71,6 +76,20 @@ local RESPAWN_MAX_WAIT = 90     -- kalau tombol tetap dianggap belum siap selama
 local RESPAWN_SETTLE = 1.5      -- jeda setelah hidup lagi sebelum lanjut mining (dtk)
 local RESPAWN_PRESS_Q = true   -- tekan Q satu kali setelah respawn
 local RESPAWN_Q_DELAY = 3       -- Q ditekan sekian detik setelah karakter hidup lagi (dtk)
+
+-- Bertahan saat disconnect / rejoin
+local AUTO_REJOIN = true        -- kalau terputus (disconnect/kick) saat miner ON: rejoin otomatis
+local REJOIN_DELAY = 3          -- jeda sebelum mencoba rejoin (dtk)
+local REJOIN_RETRY = 15         -- jeda antar percobaan rejoin kalau gagal (dtk)
+local REJOIN_MAX_TRIES = 20     -- maks percobaan rejoin
+local AUTO_RESUME = true        -- setelah script jalan lagi, otomatis START kalau sebelumnya masih ON
+local RESUME_DELAY = 5          -- jeda setelah map & karakter siap sebelum START otomatis (dtk)
+local SAVE_FILE = "AutoMinerState.json"  -- file penyimpan pengaturan (di folder workspace executor)
+-- Cara script dimuat ulang setelah pindah server. Pilih salah satu:
+--   a) simpan script ini sebagai SCRIPT_FILE di folder workspace executor (butuh readfile), atau
+--   b) isi SCRIPT_URL dengan link raw script ini (dijalankan lewat loadstring(game:HttpGet(url)))
+local SCRIPT_FILE = "auto_miner.lua"
+local SCRIPT_URL = nil
 
 -- Ambil drop
 local PICKUP_ENABLED = true             -- true = ambil drop setelah ore hilang
@@ -114,7 +133,7 @@ end
 
 -- Matikan versi lama jika script dijalankan ulang
 if _G.StopAutoMiner then
-    _G.StopAutoMiner()
+    _G.StopAutoMiner(true) -- true = jangan timpa file simpanan
 end
 
 local isActive = false
@@ -124,6 +143,7 @@ local skipped = {}
 local currentTarget = nil
 local inCooldown = false
 local respawning = false
+local saveState = function() end -- diisi di bagian PERSISTENSI
 local settings = {}
 local isTouchDevice = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 local radiusBall = nil -- diisi di bagian VISUAL RADIUS (dideklarasikan di sini agar bisa dipakai raycast)
@@ -335,6 +355,7 @@ local monsterButton = createButton("MONSTER DIHINDARI >", THEME.blue, 22)
 
 -- Popup menu centang monster
 local POPUP_WIDTH = 170
+local monsterRefresh = {}
 local monsterPopup = Instance.new("Frame")
 monsterPopup.Name = "MonsterPopup"
 monsterPopup.Size = UDim2.fromOffset(POPUP_WIDTH, 0)
@@ -408,6 +429,7 @@ for index, monsterName in ipairs(MONSTER_NAMES) do
         checkBox.BackgroundColor3 = avoidMonster[monsterName] and THEME.green or THEME.grey
     end
     refresh()
+    monsterRefresh[monsterName] = refresh
 
     table.insert(connections, row.Activated:Connect(function()
         avoidMonster[monsterName] = not avoidMonster[monsterName]
@@ -857,6 +879,8 @@ local KEY_THRESHOLD = 0.35
 
 -- Arah tujuan (mendatar) yang sedang diikuti kamera. nil = kamera tidak disentuh.
 local camTargetDir = nil
+local moveFallback = false -- true = WASD tidak efektif, pakai Humanoid:MoveTo
+local lastKeyResend = 0
 
 -- Putar kamera sedikit demi sedikit ke arah tujuan (hanya yaw, jarak & sudut atas-bawah dibiarkan)
 table.insert(connections, RunService.RenderStepped:Connect(function(dt)
@@ -896,11 +920,15 @@ local function setKey(name, down)
     end)
 end
 
-local function releaseKeys()
-    camTargetDir = nil
+local function releaseMoveKeys()
     for name in pairs(heldKeys) do
         setKey(name, false)
     end
+end
+
+local function releaseKeys()
+    camTargetDir = nil
+    releaseMoveKeys()
 end
 
 local function tapJump()
@@ -932,9 +960,25 @@ local function steerTo(targetPos, hum, root)
     dir = dir.Unit
     camTargetDir = dir -- kamera ikut menghadap ke arah tujuan
 
-    if isTouchDevice then
+    if isTouchDevice or moveFallback then
+        if moveFallback then
+            releaseMoveKeys()
+        end
         hum:MoveTo(targetPos)
         return
+    end
+
+    -- kirim ulang tombol yang sedang ditahan (kalau event tekan sebelumnya hilang)
+    local nowTime = os.clock()
+    if nowTime - lastKeyResend > KEY_RESEND then
+        lastKeyResend = nowTime
+        for name, down in pairs(heldKeys) do
+            if down then
+                pcall(function()
+                    VirtualInputManager:SendKeyEvent(true, KEY_CODES[name], false, game)
+                end)
+            end
+        end
     end
 
     local look = camera.CFrame.LookVector
@@ -1087,11 +1131,14 @@ local function validateRoute(waypoints, params)
 
         -- 1) Dinding: raycast mendatar setinggi WALL_HEIGHT di atas titik tertinggi segmen.
         --    Gundukan lebih pendek dari ini lolos (bisa dilompati).
-        local top = math.max(a.Y, b.Y) + WALL_HEIGHT
-        local from = Vector3.new(a.X, top, a.Z)
-        local to = Vector3.new(b.X, top, b.Z)
-        if (to - from).Magnitude > 0.05 and workspace:Raycast(from, to - from, params) then
-            return false, "dinding"
+        -- Hanya setinggi badan (bukan atap gua / kanopi pohon yang jauh di atas kepala).
+        local base = math.max(a.Y, b.Y)
+        for _, h in ipairs({ WALL_HEIGHT * 0.6, WALL_HEIGHT * 0.9 }) do
+            local from = Vector3.new(a.X, base + h, a.Z)
+            local to = Vector3.new(b.X, base + h, b.Z)
+            if (to - from).Magnitude > 0.05 and workspace:Raycast(from, to - from, params) then
+                return false, "dinding"
+            end
         end
 
         -- 2) Lubang: sampel sepanjang segmen, harus ada tanah dalam MAX_DROP di bawahnya
@@ -1129,6 +1176,7 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack)
     end
 
     local best, bestLength = nil, math.huge
+    local rawBest, rawBestLength = nil, math.huge
     local validCount = 0
     local lastReason = "tidak ada jalan"
 
@@ -1155,10 +1203,20 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack)
                 end
             else
                 lastReason = "rute ditolak: " .. tostring(reason)
+                -- ditolak karena dinding tapi navmesh bilang bisa: simpan sebagai cadangan
+                if reason == "dinding" then
+                    local length = routeLength(waypoints)
+                    if length < rawBestLength then
+                        rawBest, rawBestLength = waypoints, length
+                    end
+                end
             end
         end
     end
 
+    if not best and rawBest then
+        best = rawBest
+    end
     if not best then
         return nil, lastReason
     end
@@ -1205,6 +1263,14 @@ local function followPathInner(waypoints, myChar, hum, root, deadline)
                 jumped = false
             end
 
+            -- WASD tidak menggerakkan karakter sama sekali: pindah ke MoveTo (cadangan)
+            if not moveFallback and not isTouchDevice and now - lastMoveAt > KEY_FALLBACK_AFTER then
+                moveFallback = true
+                lastMoveAt = now
+                jumped = false
+                setStatus("WASD tidak bergerak, pakai MoveTo (cadangan)")
+            end
+
             -- anti nyangkut: lompat dulu, lalu minta hitung ulang rute
             if now - lastMoveAt > 1 and not jumped then
                 jumped = true
@@ -1248,6 +1314,7 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
     end
 
     travelling = true
+    moveFallback = false
     local ok, result = pcall(function()
         local deadline = os.clock() + WALK_TIMEOUT
         local repaths = 0
@@ -2206,8 +2273,11 @@ end
 -- ==========================================================
 -- MEMATIKAN SCRIPT
 -- ==========================================================
-local function stopScript()
+local function stopScript(skipSave)
     isActive = false
+    if skipSave ~= true then
+        saveState() -- dimatikan manual: jangan auto-START lagi nanti
+    end
     isAlive = false
     for other in pairs(playerMarks) do
         removeMark(other)
@@ -2275,6 +2345,190 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, ga
         stopScript()
     end
 end))
+
+-- ==========================================================
+-- PERSISTENSI: SIMPAN PENGATURAN, AUTO RESUME, AUTO REJOIN
+-- ==========================================================
+local queueTeleportFn = queue_on_teleport or queueonteleport
+    or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+
+local function readState()
+    if not (isfile and readfile and SAVE_FILE) then
+        return nil
+    end
+    local ok, data = pcall(function()
+        if not isfile(SAVE_FILE) then
+            return nil
+        end
+        return HttpService:JSONDecode(readfile(SAVE_FILE))
+    end)
+    if ok and type(data) == "table" then
+        return data
+    end
+    return nil
+end
+
+local lastSaved = nil
+saveState = function()
+    if not (writefile and SAVE_FILE) then
+        return
+    end
+    local ok, encoded = pcall(function()
+        return HttpService:JSONEncode({
+            clicks = inputClicks.Text,
+            wait = inputWait.Text,
+            reach = inputReach.Text,
+            ignore = inputIgnore.Text,
+            active = isActive,
+            mined = mined,
+            picked = picked,
+            gvq = gvqCount,
+            avoid = avoidMonster,
+        })
+    end)
+    if not ok or encoded == lastSaved then
+        return
+    end
+    if pcall(writefile, SAVE_FILE, encoded) then
+        lastSaved = encoded
+    end
+end
+
+-- Muat pengaturan terakhir
+local resumeWanted = false
+do
+    local data = readState()
+    if data then
+        if type(data.clicks) == "string" then inputClicks.Text = data.clicks end
+        if type(data.wait) == "string" then inputWait.Text = data.wait end
+        if type(data.reach) == "string" then inputReach.Text = data.reach end
+        if type(data.ignore) == "string" then inputIgnore.Text = data.ignore end
+        if type(data.mined) == "number" then mined = data.mined end
+        if type(data.picked) == "number" then picked = data.picked end
+        if type(data.gvq) == "number" then gvqCount = data.gvq end
+        if type(data.avoid) == "table" then
+            for monsterName in pairs(avoidMonster) do
+                if type(data.avoid[monsterName]) == "boolean" then
+                    avoidMonster[monsterName] = data.avoid[monsterName]
+                    if monsterRefresh[monsterName] then
+                        monsterRefresh[monsterName]()
+                    end
+                end
+            end
+        end
+        updateStats()
+        resumeWanted = AUTO_RESUME and data.active == true
+    end
+end
+
+-- Simpan berkala (hanya menulis kalau ada perubahan)
+task.spawn(function()
+    while isAlive do
+        saveState()
+        task.wait(2)
+    end
+end)
+
+-- Auto resume: tunggu game, map, dan karakter siap, lalu START otomatis
+if resumeWanted then
+    task.spawn(function()
+        if not game:IsLoaded() then
+            game.Loaded:Wait()
+        end
+        local waited = 0
+        while isAlive and waited < 90 do
+            local _, _, root = getChar()
+            local maps = workspace:FindFirstChild("Maps")
+            local world = maps and maps:FindFirstChild("World")
+            if root and world and world:FindFirstChild("Spawn_Ore") then
+                break
+            end
+            setStatus(string.format("Menunggu map & karakter siap (%d dtk)", waited))
+            task.wait(1)
+            waited += 1
+        end
+        if not isAlive or isActive then
+            return
+        end
+        setStatus("Lanjut otomatis setelah masuk lagi...")
+        task.wait(RESUME_DELAY)
+        if isAlive and not isActive then
+            startMiner()
+        end
+    end)
+end
+
+-- Muat ulang script otomatis setelah pindah server / rejoin (butuh queue_on_teleport + file/URL)
+local reloadQueued = false
+local function queueReload()
+    if reloadQueued or not queueTeleportFn then
+        return reloadQueued
+    end
+    local loader = nil
+    if SCRIPT_URL then
+        loader = string.format('loadstring(game:HttpGet("%s"))()', SCRIPT_URL)
+    elseif SCRIPT_FILE and isfile and readfile and isfile(SCRIPT_FILE) then
+        loader = string.format('loadstring(readfile("%s"))()', SCRIPT_FILE)
+    end
+    if loader and pcall(queueTeleportFn, loader) then
+        reloadQueued = true
+    end
+    return reloadQueued
+end
+
+if AUTO_REJOIN then
+    queueReload()
+end
+
+-- Auto rejoin saat terputus
+local rejoining = false
+local function onDisconnected()
+    if rejoining or not isAlive or not AUTO_REJOIN or not isActive then
+        return
+    end
+    rejoining = true
+    saveState() -- active = true tersimpan, jadi nanti lanjut otomatis
+
+    task.spawn(function()
+        queueReload()
+        for attempt = 1, REJOIN_MAX_TRIES do
+            if not isAlive then
+                return
+            end
+            setStatus(string.format("Terputus. Rejoin dalam %d dtk (percobaan %d/%d)",
+                attempt == 1 and REJOIN_DELAY or REJOIN_RETRY, attempt, REJOIN_MAX_TRIES))
+            task.wait(attempt == 1 and REJOIN_DELAY or REJOIN_RETRY)
+            pcall(function()
+                TeleportService:Teleport(game.PlaceId, player)
+            end)
+        end
+        setStatus("Rejoin gagal, coba masuk manual")
+        rejoining = false
+    end)
+end
+
+table.insert(connections, GuiService.ErrorMessageChanged:Connect(function(message)
+    if message and message ~= "" then
+        onDisconnected()
+    end
+end))
+
+task.spawn(function()
+    local ok = pcall(function()
+        local promptGui = CoreGui:WaitForChild("RobloxPromptGui", 15)
+        local overlay = promptGui and promptGui:WaitForChild("promptOverlay", 15)
+        if overlay then
+            table.insert(connections, overlay.ChildAdded:Connect(function(child)
+                if child.Name == "ErrorPrompt" then
+                    onDisconnected()
+                end
+            end))
+        end
+    end)
+    if not ok then
+        warn("Auto Miner: tidak bisa memantau prompt disconnect")
+    end
+end)
 
 -- ==========================================================
 -- LOOP UTAMA
