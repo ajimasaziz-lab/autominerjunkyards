@@ -1,29 +1,16 @@
 -- Auto Miner (F-only + deteksi tombol Mine / Stop Mining) + JALAN KAKI DENGAN KALKULASI RUTE
 -- Perubahan versi ini:
---  * BARU: rute ke target (ore & drop) sekarang juga menghindari monster Kettle Beetle & Critter Goblin.
---      - Rute yang lewat dalam jarak ROUTE_MONSTER_CLEARANCE (50 stud) dari monster DITOLAK.
---      - Bot mencoba rute memutar lewat titik di sekeliling monster.
---      - Kalau semua rute terhalang monster: tunggu sebentar, hitung ulang.
---      - Saat berjalan, monster dipantau terus: kalau mendekati rute di depan -> berhenti & hitung ulang rute.
---      - Centang di menu "MONSTER DIHINDARI" tetap berlaku (tidak dicentang = tidak dihindari di rute).
---  * BARU: kalau muncul teks "Inventory Full", waktu tunggu ambil drop dipersingkat jadi setengahnya.
---  * FIX: lompat-lompat di tempat sebelum sampai target (selesai begitu sudah dalam jangkauan, lompat tidak beruntun/di udara,
---    titik rute dilewati kalau titik berikutnya sudah dekat, geser sedikit saat nyangkut sebelum hitung ulang rute).
---  * FIX: tidak mau turun dari tebing -> kalau tidak ada rute, karakter mencari tepi yang aman lalu melangkah turun
---    (maks MAX_FALL stud, hanya ke titik yang punya rute ke target).
---  * BARU: tombol RESET HITUNGAN (ketuk 2x) untuk mengosongkan hitungan Gold Veined Quartz (+ Ore & Drop).
---  * SEMUA teleport / noclip / anchor / jalan bawah tanah / meluncur menembus objek DIHAPUS.
---  * Menuju target mining (dan drop) dengan:
---      1. Cari beberapa titik pijakan di sekitar target (di tanah, dalam jarak "Jarak ke ore").
---      2. Hitung rute dengan PathfindingService (dinding tidak bisa dilewati -> otomatis cari jalan lain,
---         gundukan kecil <= WALL_HEIGHT tetap boleh dilompati, air dihindari).
---      3. Rute DIVERIFIKASI ulang dengan raycast (dinding / lubang dalam / monster).
---      4. Rute terbaik ditandai GARIS HIJAU, baru karakter berjalan mengikuti garis itu
---         dengan menekan tombol WASD (relatif kamera) + Space untuk lompat, seperti main biasa.
---      5. Nyangkut -> lompat (Space) -> hitung ulang rute (maks MAX_REPATH kali).
---      6. Kalau tidak ada rute yang bisa dicapai -> ore itu di-skip, lanjut ke target berikutnya.
---  * Auto respawn: kalau mati, tunggu tombol Respawn aktif -> klik -> lanjut mining lagi.
---  * Bertahan saat disconnect: pengaturan disimpan ke file, auto START lagi, auto rejoin + muat ulang script.
+--  * FIX GERAKAN: karakter sekarang digerakkan lewat tombol WASD (8 arah, termasuk S) DAN Humanoid:Move
+--    yang dipasang setelah kontrol bawaan Roblox (seperti joystick). Jadi tetap jalan walau event tombol
+--    tidak diterima game, dan di HP/emulator juga jalan.
+--  * FIX: lompat juga langsung lewat Humanoid.Jump sebagai penjamin.
+--  * FIX: cek monster dilonggarkan (clearance 30 stud, lookahead 30 stud) supaya tidak sering berhenti hitung ulang.
+--  * FIX: STUCK_TIME 2.5 dtk.
+--  * Rute ke target (ore & drop) menghindari monster Kettle Beetle & Critter Goblin.
+--  * Kalau muncul teks "Inventory Full", waktu tunggu ambil drop dipersingkat jadi setengahnya.
+--  * Tombol RESET HITUNGAN (ketuk 2x).
+--  * Tanpa teleport / noclip / jalan bawah tanah.
+--  * Auto respawn, auto rejoin, auto resume.
 -- Tombol UI atau 0 = start/stop | X = mark + skip SP ini | End = matikan script
 
 local Players = game:GetService("Players")
@@ -64,7 +51,7 @@ local MAX_FALL = 30             -- tinggi maksimal yang boleh dilompati turun (s
 local MAX_DROPDOWN_TRIES = 3    -- maks percobaan turun per perjalanan
 local MAX_CANDIDATES = 6        -- maks titik pijakan di dekat target yang dicoba hitung rutenya
 local MAX_REPATH = 3            -- maks hitung ulang rute kalau nyangkut
-local STUCK_TIME = 2            -- diam sekian detik = dianggap nyangkut
+local STUCK_TIME = 2.5          -- diam sekian detik = dianggap nyangkut
 local WAYPOINT_TIMEOUT = 7      -- batas waktu menuju satu titik rute (dtk)
 local WALK_TIMEOUT = 120        -- batas total waktu jalan ke satu target (dtk)
 local UNREACHABLE_SKIP = 90     -- ore yang tidak bisa dicapai di-skip selama ini (dtk)
@@ -75,20 +62,20 @@ local PROMPT_MARGIN = 2.5       -- berdiri minimal sedekat (jarak aktif tombol M
 local MIN_REACH = 2             -- jarak terdekat yang dicoba saat mendekat lagi (stud)
 local MAX_CLOSER = 3            -- maks berapa kali mendekat lagi kalau tombol Mine belum muncul
 local GROUND_SCAN = 150         -- jarak raycast ke bawah untuk cari tanah (stud)
-local KEY_FALLBACK_AFTER = 0.8  -- WASD tidak menggerakkan karakter selama ini (dtk) -> pakai MoveTo sebagai cadangan
-local KEY_RESEND = 0.4           -- kirim ulang tombol yang sedang ditahan tiap sekian detik (jaga-jaga event hilang)
+local KEY_FALLBACK_AFTER = 0.8  -- (tidak dipakai lagi)
+local KEY_RESEND = 0.4          -- kirim ulang tombol yang sedang ditahan tiap sekian detik (jaga-jaga event hilang)
 local CAMERA_FOLLOW = true      -- saat berjalan, kamera diputar halus ke arah tujuan
 local CAMERA_TURN_SPEED = 4     -- kehalusan putar kamera (makin besar = makin cepat menyusul)
 local CAMERA_MAX_TURN = 160     -- batas kecepatan putar kamera (derajat/detik)
 
 -- Hindari monster di sepanjang rute
 local ROUTE_AVOID_MONSTERS = { "Kettle Beetle", "Critter Goblin" } -- monster yang dihindari di rute
-local ROUTE_MONSTER_CLEARANCE = 50   -- rute harus menjauh minimal segini dari monster (stud)
+local ROUTE_MONSTER_CLEARANCE = 30   -- rute harus menjauh minimal segini dari monster (stud)
 local ROUTE_DETOUR_EXTRA = 10        -- tambahan jarak titik belok saat memutar menghindari monster (stud)
 local MAX_DETOURS = 4                -- maks titik belok yang dicoba per target
-local MONSTER_LOOKAHEAD = 50         -- saat berjalan, cek monster pada rute sejauh ini ke depan (stud)
+local MONSTER_LOOKAHEAD = 30         -- saat berjalan, cek monster pada rute sejauh ini ke depan (stud)
 local MONSTER_CHECK_INTERVAL = 0.4   -- seberapa sering cek monster saat berjalan (dtk)
-local MAX_MONSTER_REPATH = 8         -- maks hitung ulang rute karena monster mendekat
+local MAX_MONSTER_REPATH = 12        -- maks hitung ulang rute karena monster mendekat
 local MONSTER_WAIT_TRIES = 3         -- kalau semua rute terhalang monster: tunggu & coba lagi sekian kali
 local MONSTER_WAIT_TIME = 2          -- lama tiap tunggu (dtk)
 local routeAvoidSet = {}
@@ -101,7 +88,7 @@ local AUTO_RESPAWN = true       -- true = kalau mati, tunggu tombol Respawn akti
 local RESPAWN_RETRY = 1.5       -- jeda antar klik Respawn kalau belum hidup (dtk)
 local RESPAWN_MAX_WAIT = 90     -- kalau tombol tetap dianggap belum siap selama ini, tetap coba klik (dtk)
 local RESPAWN_SETTLE = 1.5      -- jeda setelah hidup lagi sebelum lanjut mining (dtk)
-local RESPAWN_PRESS_Q = true   -- tekan Q satu kali setelah respawn
+local RESPAWN_PRESS_Q = true    -- tekan Q satu kali setelah respawn
 local RESPAWN_Q_DELAY = 3       -- Q ditekan sekian detik setelah karakter hidup lagi (dtk)
 
 -- Bertahan saat disconnect / rejoin
@@ -933,9 +920,7 @@ local function clearPath()
     pathFolder:ClearAllChildren()
 end
 
--- Kontrol gerak lewat tombol WASD (disimulasikan) + Space untuk lompat.
--- Arah W/A/S/D dihitung relatif terhadap kamera, sama seperti kalau kamu menekan tombolnya sendiri.
--- (Di perangkat sentuh tidak ada keyboard, jadi otomatis memakai Humanoid:MoveTo.)
+-- Kontrol gerak: tombol WASD (8 arah, relatif kamera) + Humanoid:Move sebagai penjamin.
 local KEY_CODES = {
     W = Enum.KeyCode.W,
     A = Enum.KeyCode.A,
@@ -943,14 +928,30 @@ local KEY_CODES = {
     D = Enum.KeyCode.D,
 }
 local heldKeys = { W = false, A = false, S = false, D = false }
-local KEY_THRESHOLD = 0.35
+local KEY_THRESHOLD = 0.38
 
--- Arah tujuan (mendatar) yang sedang diikuti kamera. nil = kamera tidak disentuh.
-local camTargetDir = nil
-local moveFallback = false -- true = WASD tidak efektif, pakai Humanoid:MoveTo
+local camTargetDir = nil   -- arah yang diikuti kamera
+local moveVector = nil     -- arah gerak dunia yang diterapkan tiap frame
+local moveFallback = false -- (tidak dipakai lagi, dibiarkan supaya kode lain tidak error)
 local lastKeyResend = 0
 
--- Putar kamera sedikit demi sedikit ke arah tujuan (hanya yaw, jarak & sudut atas-bawah dibiarkan)
+-- Terapkan gerak SETELAH kontrol bawaan Roblox, supaya tidak ditimpa jadi 0.
+-- Ini bekerja seperti joystick, jadi tetap jalan walau event tombol tidak diterima game.
+pcall(function()
+    RunService:UnbindFromRenderStep("AutoMinerMove")
+end)
+RunService:BindToRenderStep("AutoMinerMove", Enum.RenderPriority.Input.Value + 1, function()
+    local dir = moveVector
+    if not dir or not isActive or not isAlive then
+        return
+    end
+    local _, hum = getChar()
+    if hum then
+        hum:Move(dir, false)
+    end
+end)
+
+-- Putar kamera halus ke arah tujuan (hanya yaw)
 table.insert(connections, RunService.RenderStepped:Connect(function(dt)
     local dir = camTargetDir
     if not dir or not CAMERA_FOLLOW or not isActive then
@@ -996,6 +997,7 @@ end
 
 local function releaseKeys()
     camTargetDir = nil
+    moveVector = nil
     releaseMoveKeys()
 end
 
@@ -1011,10 +1013,10 @@ local function tapJump()
         return false -- masih di udara
     end
     lastJumpAt = now
+    if h then
+        h.Jump = true -- penjamin kalau event Space tidak diterima
+    end
     if isTouchDevice then
-        if h then
-            h.Jump = true
-        end
         return true
     end
     task.spawn(function()
@@ -1027,26 +1029,23 @@ local function tapJump()
     return true
 end
 
--- Tekan kombinasi WASD supaya karakter bergerak menuju targetPos
+-- Jalan menuju targetPos: tekan kombinasi WASD sesuai arah + terapkan Humanoid:Move
 local function steerTo(targetPos, hum, root)
     local camera = workspace.CurrentCamera
     local dir = Vector3.new(targetPos.X - root.Position.X, 0, targetPos.Z - root.Position.Z)
-    if not camera or dir.Magnitude < 0.1 then
+    if dir.Magnitude < 0.1 then
         releaseKeys()
         return
     end
     dir = dir.Unit
-    camTargetDir = dir -- kamera ikut menghadap ke arah tujuan
+    camTargetDir = dir
+    moveVector = dir -- gerak langsung ke tujuan, tidak peduli arah kamera
 
-    if isTouchDevice or moveFallback then
-        if moveFallback then
-            releaseMoveKeys()
-        end
-        hum:MoveTo(targetPos)
-        return
+    if isTouchDevice or not camera then
+        return -- HP: tidak ada keyboard, cukup Humanoid:Move
     end
 
-    -- kirim ulang tombol yang sedang ditahan (kalau event tekan sebelumnya hilang)
+    -- kirim ulang tombol yang sedang ditahan (jaga-jaga event hilang)
     local nowTime = os.clock()
     if nowTime - lastKeyResend > KEY_RESEND then
         lastKeyResend = nowTime
@@ -1071,24 +1070,16 @@ local function steerTo(targetPos, hum, root)
     local f = dir:Dot(forward)
     local r = dir:Dot(right)
 
-    -- Natural: tidak pernah jalan mundur (tanpa S). Kamera sudah berputar ke arah tujuan,
-    -- jadi biasanya cukup W. Kalau tujuan ada di samping/belakang, karakter berbelok dulu
-    -- dengan A/D sambil kamera menyusul, lalu maju lagi.
     local wantW = f > KEY_THRESHOLD
+    local wantS = f < -KEY_THRESHOLD
     local wantD = r > KEY_THRESHOLD
     local wantA = r < -KEY_THRESHOLD
-
-    if f <= 0 and not wantA and not wantD then
-        -- tujuan tepat di belakang: pilih salah satu sisi untuk berbalik
-        wantD = true
-    end
-    if f > 0.9 then
-        -- sudah hampir lurus: cukup W saja (tidak zig-zag)
-        wantA, wantD = false, false
+    if math.abs(f) > 0.9 then
+        wantA, wantD = false, false -- hampir lurus: satu tombol saja
     end
 
     setKey("W", wantW)
-    setKey("S", false)
+    setKey("S", wantS)
     setKey("D", wantD)
     setKey("A", wantA)
 end
@@ -1562,15 +1553,6 @@ local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goa
             end
             local stalled = now - lastMoveAt
 
-            -- WASD tidak menggerakkan karakter sama sekali: pindah ke MoveTo (cadangan)
-            if not moveFallback and not isTouchDevice and stalled > KEY_FALLBACK_AFTER then
-                moveFallback = true
-                lastMoveAt = now
-                stalled = 0
-                stallStage = 0
-                setStatus("WASD tidak bergerak, pakai MoveTo (cadangan)")
-            end
-
             -- Karakter sama sekali tidak bergerak: mungkin masih terkunci mode mining -> hentikan dulu
             if stalled > 1.0 and stopTries < 2 and stopMiningIfActive() then
                 stopTries += 1
@@ -1943,6 +1925,7 @@ local function stopMiner(reason)
     inCooldown = false
     markTarget(nil)
     clearPath()
+    releaseKeys()
     setToggleVisual(false)
     setState("STOP", THEME.grey)
     if reason then
@@ -2833,6 +2816,9 @@ local function stopScript(skipSave)
         radiusBall:Destroy()
     end
     releaseKeys()
+    pcall(function()
+        RunService:UnbindFromRenderStep("AutoMinerMove")
+    end)
     pathFolder:Destroy()
     for _, connection in ipairs(connections) do
         connection:Disconnect()
