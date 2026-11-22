@@ -1163,8 +1163,10 @@ local function routeLength(waypoints)
 end
 
 -- Hitung rute terbaik ke salah satu titik pijakan dekat target. nil = tidak ada rute valid.
-local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack)
+local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack, extraRadius)
     slack = slack or 2
+    local pathParams = table.clone(PATH_PARAMS)
+    pathParams.AgentRadius = AGENT_RADIUS + (extraRadius or 0)
     local params = buildRayParams(ignoreInstance)
     local candidates = buildCandidates(targetPos, reach, fromPos, params, slack)
     if #candidates == 0 then
@@ -1182,7 +1184,7 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack)
 
     for i = 1, math.min(#candidates, MAX_CANDIDATES) do
         local ok, waypoints = pcall(function()
-            local path = PathfindingService:CreatePath(PATH_PARAMS)
+            local path = PathfindingService:CreatePath(pathParams)
             path:ComputeAsync(fromPos, candidates[i].pos)
             if path.Status ~= Enum.PathStatus.Success then
                 return nil
@@ -1227,6 +1229,7 @@ end
 local function followPathInner(waypoints, myChar, hum, root, deadline)
     local lastIndex = #waypoints
     local index = 2
+    local sideSign = 1
 
     while index <= lastIndex do
         local waypoint = waypoints[index]
@@ -1237,7 +1240,8 @@ local function followPathInner(waypoints, myChar, hum, root, deadline)
         local startedAt = os.clock()
         local lastPos = root.Position
         local lastMoveAt = os.clock()
-        local jumped = false
+        local stallStage = 0
+        local sideUntil = 0
 
         while true do
             if not isActive or not isAlive then
@@ -1257,31 +1261,50 @@ local function followPathInner(waypoints, myChar, hum, root, deadline)
                 break
             end
 
-            if (pos - lastPos).Magnitude > 1 then
+            -- Kemajuan diukur MENDATAR saja: lompat di tempat (naik-turun) tidak dihitung maju,
+            -- jadi kalau karakter cuma loncat-loncat di depan batu, itu terdeteksi sebagai nyangkut.
+            if flatDist(pos, lastPos) > 1 then
                 lastPos = pos
                 lastMoveAt = now
-                jumped = false
+                stallStage = 0
+                sideUntil = 0
             end
+            local stalled = now - lastMoveAt
 
             -- WASD tidak menggerakkan karakter sama sekali: pindah ke MoveTo (cadangan)
-            if not moveFallback and not isTouchDevice and now - lastMoveAt > KEY_FALLBACK_AFTER then
+            if not moveFallback and not isTouchDevice and stalled > KEY_FALLBACK_AFTER then
                 moveFallback = true
                 lastMoveAt = now
-                jumped = false
+                stalled = 0
+                stallStage = 0
                 setStatus("WASD tidak bergerak, pakai MoveTo (cadangan)")
             end
 
-            -- anti nyangkut: lompat dulu, lalu minta hitung ulang rute
-            if now - lastMoveAt > 1 and not jumped then
-                jumped = true
+            -- Anti nyangkut bertahap (sambil tetap menahan maju):
+            --   1) lompat sambil maju  2) lompat + geser serong ke samping  3) hitung ulang rute
+            if stallStage == 0 and stalled > 0.6 then
+                stallStage = 1
                 tapJump()
+            elseif stallStage == 1 and stalled > 1.3 then
+                stallStage = 2
+                tapJump()
+                sideSign = -sideSign
+                sideUntil = now + 0.9
             end
-            if now - lastMoveAt > STUCK_TIME or now - startedAt > WAYPOINT_TIMEOUT then
+            if stalled > STUCK_TIME or now - startedAt > WAYPOINT_TIMEOUT then
                 -- tersangkut tepat di ujung rute (mis. terhalang ore itu sendiri) = sudah sedekat mungkin
                 return index == lastIndex and "done" or "stuck"
             end
 
-            steerTo(waypoint.Position, hum, root)
+            local aim = waypoint.Position
+            if now < sideUntil then
+                local d = Vector3.new(aim.X - pos.X, 0, aim.Z - pos.Z)
+                if d.Magnitude > 0.1 then
+                    local perp = Vector3.new(-d.Z, 0, d.X).Unit * sideSign
+                    aim = pos + d.Unit * 2 + perp * 6 -- serong: maju sedikit + ke samping
+                end
+            end
+            steerTo(aim, hum, root)
             task.wait(0.05)
         end
         index += 1
@@ -1337,7 +1360,7 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
 
             setStatus("Menghitung rute...")
             local feet = r2.Position - Vector3.new(0, r2.Size.Y / 2 + h2.HipHeight, 0)
-            local route, reason = computeRoute(feet, targetPos, reach, ignoreInstance, tol - 1)
+            local route, reason = computeRoute(feet, targetPos, reach, ignoreInstance, tol - 1, repaths * 1.0)
             if not route then
                 setStatus("Tidak bisa dicapai: " .. tostring(reason))
                 return false
