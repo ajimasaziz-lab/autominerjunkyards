@@ -6,6 +6,7 @@
 --      - Kalau semua rute terhalang monster: tunggu sebentar, hitung ulang.
 --      - Saat berjalan, monster dipantau terus: kalau mendekati rute di depan -> berhenti & hitung ulang rute.
 --      - Centang di menu "MONSTER DIHINDARI" tetap berlaku (tidak dicentang = tidak dihindari di rute).
+--  * BARU: kalau muncul teks "Inventory Full", waktu tunggu ambil drop dipersingkat jadi setengahnya.
 --  * SEMUA teleport / noclip / anchor / jalan bawah tanah / meluncur menembus objek DIHAPUS.
 --  * Menuju target mining (dan drop) dengan:
 --      1. Cari beberapa titik pijakan di sekitar target (di tanah, dalam jarak "Jarak ke ore").
@@ -120,6 +121,11 @@ local PICKUP_CLICKS = 2                 -- klik cadangan per item
 local PICKUP_DISTANCE = 4               -- jarak berdiri dari item saat mengambil (stud)
 local DROP_GRACE = 1.5                  -- drop harus kosong selama ini (dtk) sebelum dianggap selesai
 local DROP_MAX_WAIT = 20                -- batas total menunggu semua drop terambil (dtk), lalu lanjut
+
+-- Inventory penuh: kalau muncul teks "Inventory Full", waktu tunggu ambil drop dipersingkat
+local INVENTORY_FULL_TEXT = "Inventory Full"  -- teks yang dicari di layar (huruf besar/kecil & spasi diabaikan)
+local INVENTORY_FULL_FACTOR = 0.5       -- pengali waktu tunggu drop saat inventory penuh (0.5 = setengahnya)
+local INVENTORY_FULL_HOLD = 6           -- mode singkat bertahan sekian detik sejak teks terakhir terlihat (dtk)
 
 -- Retry mining kalau ore tidak hilang setelah tekan F
 local RETRY_AFTER = 4                   -- (cadangan, kalau tombol tidak terdeteksi) ore masih ada sekian detik: jalan ulang + tekan F lagi
@@ -1884,6 +1890,76 @@ local function clickDrop(part)
     return clickOnce(math.floor(screenPoint.X), math.floor(screenPoint.Y))
 end
 
+-- ----- Deteksi teks "Inventory Full" -----
+local INVENTORY_FULL_KEY = normalizeName(INVENTORY_FULL_TEXT)
+local inventoryFullUntil = 0
+local lastInvScan = 0
+
+local function isInvFullText(text)
+    return type(text) == "string" and #text > 0 and #text < 80
+        and normalizeName(text):find(INVENTORY_FULL_KEY, 1, true) ~= nil
+end
+
+local function invLabelVisible(label)
+    if label.TextTransparency >= 1 then
+        return false
+    end
+    local current = label
+    while current and current ~= game do
+        if current:IsA("GuiObject") and not current.Visible then
+            return false
+        end
+        if current:IsA("ScreenGui") then
+            return current.Enabled
+        end
+        current = current.Parent
+    end
+    return true
+end
+
+local function scanInventoryFull()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then
+        return false
+    end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton"))
+            and isInvFullText(d.Text)
+            and not d:IsDescendantOf(gui)
+            and invLabelVisible(d) then
+            return true
+        end
+    end
+    return false
+end
+
+-- true selama teks "Inventory Full" terlihat (dan INVENTORY_FULL_HOLD detik sesudahnya)
+local function inventoryFull()
+    local now = os.clock()
+    if now - lastInvScan >= 0.25 then
+        lastInvScan = now
+        if scanInventoryFull() then
+            inventoryFullUntil = now + INVENTORY_FULL_HOLD
+        end
+    end
+    return now < inventoryFullUntil
+end
+
+-- Pengali waktu tunggu drop: 1 normal, INVENTORY_FULL_FACTOR saat inventory penuh
+local function dropWaitFactor()
+    return inventoryFull() and INVENTORY_FULL_FACTOR or 1
+end
+
+-- Pantau terus supaya notifikasi yang muncul sebentar tetap tertangkap
+task.spawn(function()
+    while isAlive do
+        if isActive then
+            pcall(inventoryFull)
+        end
+        task.wait(0.3)
+    end
+end)
+
 local function collectRound(drops)
     for index, drop in ipairs(drops) do
         if not drop.item.Parent then
@@ -1899,7 +1975,7 @@ local function collectRound(drops)
             givenUpDrops[drop.item] = true
             continue
         end
-        if not waitFor(0.25) then return false end
+        if not waitFor(0.25 * dropWaitFactor()) then return false end
 
         if PICKUP_USE_REMOTE and getPickupId(drop.item) then
             local tries = 0
@@ -1908,7 +1984,7 @@ local function collectRound(drops)
                 if not requestPickup(drop.item) then
                     break
                 end
-                if not waitFor(PICKUP_RETRY) then return false end
+                if not waitFor(PICKUP_RETRY * dropWaitFactor()) then return false end
             end
         end
 
@@ -1919,7 +1995,7 @@ local function collectRound(drops)
             if not clickDrop(drop.part) then
                 break
             end
-            if not waitFor(0.2) then return false end
+            if not waitFor(0.2 * dropWaitFactor()) then return false end
         end
 
         if not drop.item.Parent then
@@ -1935,7 +2011,7 @@ local function collectRound(drops)
 end
 
 local function waitAllDrops(center)
-    local deadline = os.clock() + DROP_MAX_WAIT
+    local startedAt = os.clock()
     local emptySince = nil
 
     while true do
@@ -1944,7 +2020,7 @@ local function waitAllDrops(center)
         if #drops > 0 then
             emptySince = nil
 
-            if os.clock() >= deadline then
+            if os.clock() - startedAt >= DROP_MAX_WAIT * dropWaitFactor() then
                 for _, drop in ipairs(drops) do
                     givenUpDrops[drop.item] = true
                 end
@@ -1952,7 +2028,8 @@ local function waitAllDrops(center)
                 return true
             end
 
-            setState(string.format("OFF | ambil %d drop", #drops), THEME.orange)
+            setState(string.format("OFF | ambil %d drop%s", #drops,
+                inventoryFull() and " (inv penuh, waktu x" .. INVENTORY_FULL_FACTOR .. ")" or ""), THEME.orange)
             if PICKUP_ENABLED then
                 if not collectRound(drops) then return false end
             else
@@ -1960,7 +2037,7 @@ local function waitAllDrops(center)
             end
         else
             emptySince = emptySince or os.clock()
-            if os.clock() - emptySince >= DROP_GRACE then
+            if os.clock() - emptySince >= DROP_GRACE * dropWaitFactor() then
                 return true
             end
             setState("OFF | cek drop", THEME.orange)
