@@ -64,6 +64,7 @@ local MAX_CLOSER = 3            -- maks berapa kali mendekat lagi kalau tombol M
 local GROUND_SCAN = 150         -- jarak raycast ke bawah untuk cari tanah (stud)
 local KEY_FALLBACK_AFTER = 0.8  -- (tidak dipakai lagi)
 local KEY_RESEND = 0.4          -- kirim ulang tombol yang sedang ditahan tiap sekian detik (jaga-jaga event hilang)
+local RUN_WITH_SHIFT = true      -- true = tahan Shift (lari) selama berjalan, dilepas saat berhenti
 local CAMERA_FOLLOW = true      -- saat berjalan, kamera diputar halus ke arah tujuan
 local CAMERA_TURN_SPEED = 4     -- kehalusan putar kamera (makin besar = makin cepat menyusul)
 local CAMERA_MAX_TURN = 160     -- batas kecepatan putar kamera (derajat/detik)
@@ -926,8 +927,9 @@ local KEY_CODES = {
     A = Enum.KeyCode.A,
     S = Enum.KeyCode.S,
     D = Enum.KeyCode.D,
+    Shift = Enum.KeyCode.LeftShift, -- lari
 }
-local heldKeys = { W = false, A = false, S = false, D = false }
+local heldKeys = { W = false, A = false, S = false, D = false, Shift = false }
 local KEY_THRESHOLD = 0.38
 
 local camTargetDir = nil   -- arah yang diikuti kamera
@@ -1082,6 +1084,8 @@ local function steerTo(targetPos, hum, root)
     setKey("S", wantS)
     setKey("D", wantD)
     setKey("A", wantA)
+    -- Shift = lari: ditahan selama ada tombol arah yang ditekan
+    setKey("Shift", RUN_WITH_SHIFT and (wantW or wantS or wantA or wantD))
 end
 
 -- Gambar rute sebagai garis hijau
