@@ -1444,6 +1444,31 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack, ex
     return best
 end
 
+-- Kalau karakter masih dalam mode mining (tombol "Stop Mining" tampil), gerakan biasanya terkunci.
+-- Tekan F sekali untuk berhenti menambang. Hasil true = F ditekan.
+local lastStopTry = 0
+local function stopMiningIfActive()
+    if os.clock() - lastStopTry < 1.5 then
+        return false
+    end
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then
+        return false
+    end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible and #d.Text > 0 and #d.Text < 20
+            and not d:IsDescendantOf(gui) and d.Text:lower():find("stop", 1, true) then
+            local sg = d:FindFirstAncestorWhichIsA("ScreenGui")
+            if sg and sg.Enabled then
+                lastStopTry = os.clock()
+                pressF()
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- Ikuti rute dengan berjalan biasa. Hasil: "done" | "stuck" | "abort" | "timeout" | "monster"
 local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goalNear)
     local lastIndex = #waypoints
@@ -1462,6 +1487,7 @@ local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goa
         local lastMoveAt = os.clock()
         local stallStage = 0
         local sideUntil = 0
+        local stopTries = 0
 
         while true do
             if not isActive or not isAlive then
@@ -1543,6 +1569,17 @@ local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goa
                 stalled = 0
                 stallStage = 0
                 setStatus("WASD tidak bergerak, pakai MoveTo (cadangan)")
+            end
+
+            -- Karakter sama sekali tidak bergerak: mungkin masih terkunci mode mining -> hentikan dulu
+            if stalled > 1.0 and stopTries < 2 and stopMiningIfActive() then
+                stopTries += 1
+                lastMoveAt = now
+                stalled = 0
+                setStatus("Masih mode mining, tekan F untuk berhenti lalu jalan")
+            elseif stalled > 1.5 then
+                setStatus(string.format("Karakter tidak bergerak (WalkSpeed %.0f, Anchored %s, State %s)",
+                    hum.WalkSpeed, tostring(root.Anchored), tostring(hum:GetState().Name)))
             end
 
             -- Anti nyangkut bertahap (sambil tetap menahan maju):
@@ -2448,6 +2485,9 @@ local function mineOnce()
         end
 
         if left <= 0 then
+            if getMineState(target) == "stop" then
+                pressF() -- batalkan mining supaya karakter tidak terkunci saat pindah target
+            end
             skipped[target.ore] = os.clock() + SKIP_TIME
             setStatus(string.format("%s tidak hilang dalam %.0f dtk, lanjut", target.name, oreTimeout))
             inCooldown = false
