@@ -11,6 +11,7 @@
 --    titik rute dilewati kalau titik berikutnya sudah dekat, geser sedikit saat nyangkut sebelum hitung ulang rute).
 --  * FIX: tidak mau turun dari tebing -> kalau tidak ada rute, karakter mencari tepi yang aman lalu melangkah turun
 --    (maks MAX_FALL stud, hanya ke titik yang punya rute ke target).
+--  * BARU: tombol RESET HITUNGAN (ketuk 2x) untuk mengosongkan hitungan Gold Veined Quartz (+ Ore & Drop).
 --  * SEMUA teleport / noclip / anchor / jalan bawah tanah / meluncur menembus objek DIHAPUS.
 --  * Menuju target mining (dan drop) dengan:
 --      1. Cari beberapa titik pijakan di sekitar target (di tanah, dalam jarak "Jarak ke ore").
@@ -145,6 +146,7 @@ local MINE_CHECK_DELAY = 0.6            -- jeda setelah tekan F sebelum cek tomb
 -- Penghitung item
 local COUNT_ITEM_NAME = "Gold Veined Quartz"  -- nama item yang dihitung
 local DEBUG_ITEMS = false               -- true = cetak info tiap drop ke console
+local RESET_ALSO_ORE_DROP = true        -- true = tombol reset juga mengosongkan hitungan Ore & Drop (false = hanya item di atas)
 
 -- Jenis ore prioritas rendah: ditambang hanya kalau tidak ada jenis lain
 local LOW_PRIORITY_TYPES = { "Stone" }
@@ -383,6 +385,8 @@ Instance.new("UIPadding", inputIgnore).PaddingLeft = UDim.new(0, 8)
 local toggleButton = createButton("START", THEME.green, 26)
 local markButton = createButton("MARK + SKIP (X)", THEME.orange, 22)
 local monsterButton = createButton("MONSTER DIHINDARI >", THEME.blue, 22)
+local RESET_TEXT = "RESET HITUNGAN"
+local resetButton = createButton(RESET_TEXT, THEME.grey, 22)
 
 -- Popup menu centang monster
 local POPUP_WIDTH = 170
@@ -563,6 +567,39 @@ local function updateStats()
     end
 end
 updateStats()
+
+-- Tombol reset hitungan (ketuk 2x dalam 3 detik supaya tidak kepencet)
+do
+    local armedAt = 0
+    local function disarm()
+        armedAt = 0
+        resetButton.Text = RESET_TEXT
+        resetButton.BackgroundColor3 = THEME.grey
+    end
+
+    table.insert(connections, resetButton.Activated:Connect(function()
+        local now = os.clock()
+        if armedAt > 0 and now - armedAt <= 3 then
+            gvqCount = 0
+            if RESET_ALSO_ORE_DROP then
+                mined, picked = 0, 0
+            end
+            updateStats()
+            saveState()
+            disarm()
+            setStatus(COUNT_ITEM_NAME .. " di-reset ke 0")
+        else
+            armedAt = now
+            resetButton.Text = "KETUK LAGI UNTUK RESET"
+            resetButton.BackgroundColor3 = THEME.red
+            task.delay(3, function()
+                if armedAt == now then
+                    disarm()
+                end
+            end)
+        end
+    end))
+end
 
 -- Drag window lewat header (mouse & touch)
 do
