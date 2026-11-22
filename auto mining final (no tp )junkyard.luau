@@ -9,6 +9,8 @@
 --  * BARU: kalau muncul teks "Inventory Full", waktu tunggu ambil drop dipersingkat jadi setengahnya.
 --  * FIX: lompat-lompat di tempat sebelum sampai target (selesai begitu sudah dalam jangkauan, lompat tidak beruntun/di udara,
 --    titik rute dilewati kalau titik berikutnya sudah dekat, geser sedikit saat nyangkut sebelum hitung ulang rute).
+--  * FIX: tidak mau turun dari tebing -> kalau tidak ada rute, karakter mencari tepi yang aman lalu melangkah turun
+--    (maks MAX_FALL stud, hanya ke titik yang punya rute ke target).
 --  * SEMUA teleport / noclip / anchor / jalan bawah tanah / meluncur menembus objek DIHAPUS.
 --  * Menuju target mining (dan drop) dengan:
 --      1. Cari beberapa titik pijakan di sekitar target (di tanah, dalam jarak "Jarak ke ore").
@@ -56,6 +58,9 @@ local AGENT_HEIGHT = 5          -- tinggi karakter untuk perhitungan rute (stud)
 local WAYPOINT_SPACING = 4      -- jarak antar titik rute (stud)
 local WALL_HEIGHT = 5           -- penghalang setinggi ini atau lebih = dinding. Lebih pendek = gundukan, boleh dilompati
 local MAX_DROP = 10             -- lubang/jurang lebih dalam dari ini (stud) = tidak boleh dilewati
+local DROP_DOWN_ENABLED = true  -- kalau tidak ada rute turun (mis. di atas tebing): turun dengan melangkah dari tepi tebing
+local MAX_FALL = 30             -- tinggi maksimal yang boleh dilompati turun (stud). Kecilkan kalau game ada damage jatuh
+local MAX_DROPDOWN_TRIES = 3    -- maks percobaan turun per perjalanan
 local MAX_CANDIDATES = 6        -- maks titik pijakan di dekat target yang dicoba hitung rutenya
 local MAX_REPATH = 3            -- maks hitung ulang rute kalau nyangkut
 local STUCK_TIME = 2            -- diam sekian detik = dianggap nyangkut
@@ -1546,6 +1551,104 @@ local function followPath(waypoints, myChar, hum, root, deadline, goal, goalNear
     return result, extra
 end
 
+-- Turun dari tebing/ketinggian: cari tepi yang aman, lalu melangkah turun ke tanah di bawah
+-- (tanpa teleport). Dipakai kalau PathfindingService tidak punya rute turun.
+-- Hasil true = karakter sudah turun.
+local function tryDropDown(targetPos, myChar, hum, root, ignoreInstance, extraRadius)
+    local params = buildRayParams(ignoreInstance)
+    local pathParams = table.clone(PATH_PARAMS)
+    pathParams.AgentRadius = AGENT_RADIUS + (extraRadius or 0)
+    local monsters = getRouteMonsters()
+
+    local pos = root.Position
+    local feetY = pos.Y - (root.Size.Y / 2 + hum.HipHeight)
+
+    -- tanah di dekat target (titik tujuan perhitungan rute dari bawah)
+    local goal = targetPos
+    local goalHit = workspace:Raycast(Vector3.new(targetPos.X, targetPos.Y + 4, targetPos.Z),
+        Vector3.new(0, -GROUND_SCAN, 0), params)
+    if goalHit then
+        goal = goalHit.Position
+    end
+
+    -- kumpulkan titik pendaratan: arah mengelilingi, ada tanah yang lebih rendah (3..MAX_FALL stud)
+    local options = {}
+    for i = 0, 15 do
+        local ang = i * math.pi / 8
+        local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+        local wall = workspace:Raycast(pos, dir * 14, params) -- jalan menuju tepi harus bebas dinding
+        local maxDist = wall and math.max(wall.Distance - 2, 0) or 14
+        for _, dist in ipairs({ 4, 7, 10, 13 }) do
+            if dist <= maxDist then
+                local p = pos + dir * dist
+                local hit = workspace:Raycast(Vector3.new(p.X, pos.Y + 2, p.Z), Vector3.new(0, -GROUND_SCAN, 0), params)
+                if hit then
+                    local drop = feetY - hit.Position.Y
+                    if drop >= 3 and drop <= MAX_FALL then
+                        local safe = true
+                        for _, m in ipairs(monsters) do
+                            if flatDist(hit.Position, m.pos) < ROUTE_MONSTER_CLEARANCE * 0.8 then
+                                safe = false
+                                break
+                            end
+                        end
+                        if safe then
+                            table.insert(options, {
+                                pos = hit.Position,
+                                drop = drop,
+                                score = flatDist(hit.Position, goal) + drop * 0.5,
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if #options == 0 then
+        return false
+    end
+    table.sort(options, function(a, b)
+        return a.score < b.score
+    end)
+
+    -- pilih pendaratan yang dari sana ADA rute ke target
+    local best, bestScore = nil, math.huge
+    for i = 1, math.min(#options, 6) do
+        local waypoints = computePath(pathParams, options[i].pos, goal)
+        if waypoints then
+            local score = routeLength(waypoints) + options[i].drop * 2
+            if score < bestScore then
+                best, bestScore = options[i], score
+            end
+        end
+    end
+    if not best then
+        return false
+    end
+
+    -- melangkah dari tepi menuju titik pendaratan
+    setStatus(string.format("Tidak ada rute turun, melangkah turun (%.0f stud)", best.drop))
+    local startedAt = os.clock()
+    local startY = root.Position.Y
+    local landed = false
+    while os.clock() - startedAt < 5 do
+        if not isActive or not isAlive or player.Character ~= myChar or hum.Health <= 0 then
+            break
+        end
+        if root.Position.Y < startY - math.max(2.5, best.drop * 0.6) and hum.FloorMaterial ~= Enum.Material.Air then
+            landed = true
+            break
+        end
+        steerTo(best.pos, hum, root)
+        task.wait(0.05)
+    end
+    releaseKeys()
+    if landed then
+        task.wait(0.3)
+    end
+    return landed
+end
+
 -- Berjalan ke dekat targetPos (dalam jarak reach). Menunggu (yield) sampai selesai.
 -- Hasil true = sampai. false = tidak bisa dicapai / dihentikan.
 local function walkTo(targetPos, reach, ignoreInstance, tolerance)
@@ -1570,6 +1673,7 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
         local repaths = 0
         local monsterRepaths = 0
         local monsterWaits = 0
+        local dropAttempts = 0
 
         while true do
             local c2, h2, r2 = getChar()
@@ -1599,6 +1703,15 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
                         return false
                     end
                     continue
+                end
+                -- tidak ada rute (mis. sedang di atas tebing): coba turun dengan melangkah dari tepi
+                if DROP_DOWN_ENABLED and not monsterBlock and dropAttempts < MAX_DROPDOWN_TRIES then
+                    dropAttempts += 1
+                    setStatus(string.format("Tidak ada rute (%s), coba turun (%d/%d)",
+                        tostring(reason), dropAttempts, MAX_DROPDOWN_TRIES))
+                    if tryDropDown(targetPos, myChar, h2, r2, ignoreInstance, repaths * 1.0) then
+                        continue
+                    end
                 end
                 setStatus("Tidak bisa dicapai: " .. tostring(reason))
                 return false
