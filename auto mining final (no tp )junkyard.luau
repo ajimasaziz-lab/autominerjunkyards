@@ -7,6 +7,8 @@
 --      - Saat berjalan, monster dipantau terus: kalau mendekati rute di depan -> berhenti & hitung ulang rute.
 --      - Centang di menu "MONSTER DIHINDARI" tetap berlaku (tidak dicentang = tidak dihindari di rute).
 --  * BARU: kalau muncul teks "Inventory Full", waktu tunggu ambil drop dipersingkat jadi setengahnya.
+--  * FIX: lompat-lompat di tempat sebelum sampai target (selesai begitu sudah dalam jangkauan, lompat tidak beruntun/di udara,
+--    titik rute dilewati kalau titik berikutnya sudah dekat, geser sedikit saat nyangkut sebelum hitung ulang rute).
 --  * SEMUA teleport / noclip / anchor / jalan bawah tanah / meluncur menembus objek DIHAPUS.
 --  * Menuju target mining (dan drop) dengan:
 --      1. Cari beberapa titik pijakan di sekitar target (di tanah, dalam jarak "Jarak ke ore").
@@ -56,7 +58,7 @@ local WALL_HEIGHT = 5           -- penghalang setinggi ini atau lebih = dinding.
 local MAX_DROP = 10             -- lubang/jurang lebih dalam dari ini (stud) = tidak boleh dilewati
 local MAX_CANDIDATES = 6        -- maks titik pijakan di dekat target yang dicoba hitung rutenya
 local MAX_REPATH = 3            -- maks hitung ulang rute kalau nyangkut
-local STUCK_TIME = 2.5          -- diam sekian detik = dianggap nyangkut
+local STUCK_TIME = 2            -- diam sekian detik = dianggap nyangkut
 local WAYPOINT_TIMEOUT = 7      -- batas waktu menuju satu titik rute (dtk)
 local WALK_TIMEOUT = 120        -- batas total waktu jalan ke satu target (dtk)
 local UNREACHABLE_SKIP = 90     -- ore yang tidak bisa dicapai di-skip selama ini (dtk)
@@ -955,14 +957,23 @@ local function releaseKeys()
     releaseMoveKeys()
 end
 
+local lastJumpAt = 0
 local function tapJump()
+    local now = os.clock()
+    if now - lastJumpAt < 0.7 then
+        return false -- jangan lompat beruntun
+    end
+    local c = player.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if h and h.FloorMaterial == Enum.Material.Air then
+        return false -- masih di udara
+    end
+    lastJumpAt = now
     if isTouchDevice then
-        local c = player.Character
-        local h = c and c:FindFirstChildOfClass("Humanoid")
         if h then
             h.Jump = true
         end
-        return
+        return true
     end
     task.spawn(function()
         pcall(function()
@@ -971,6 +982,7 @@ local function tapJump()
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
         end)
     end)
+    return true
 end
 
 -- Tekan kombinasi WASD supaya karakter bergerak menuju targetPos
@@ -1391,7 +1403,7 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack, ex
 end
 
 -- Ikuti rute dengan berjalan biasa. Hasil: "done" | "stuck" | "abort" | "timeout" | "monster"
-local function followPathInner(waypoints, myChar, hum, root, deadline)
+local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goalNear)
     local lastIndex = #waypoints
     local index = 2
     local sideSign = 1
@@ -1422,9 +1434,31 @@ local function followPathInner(waypoints, myChar, hum, root, deadline)
             end
 
             local pos = root.Position
-            local arriveRadius = (index == lastIndex) and FINAL_ARRIVE_RADIUS or 3.2
+
+            -- Sudah cukup dekat dengan tujuan: selesai, tidak perlu menginjak titik rute terakhir persis
+            -- (mencegah lompat-lompat di tempat padahal sudah dalam jangkauan)
+            if goal and goalNear and (pos - goal).Magnitude <= goalNear then
+                return "done"
+            end
+
+            -- Makin lama macet, makin longgar syarat "sampai di titik rute"
+            local looseness = math.min((now - lastMoveAt) * 1.5, 3)
+            local arriveRadius = ((index == lastIndex) and FINAL_ARRIVE_RADIUS or 3.2) + looseness
             if flatDist(pos, waypoint.Position) < arriveRadius and math.abs(pos.Y - waypoint.Position.Y) < 7 then
                 break
+            end
+
+            -- Titik berikutnya sudah lebih dekat & terjangkau: lewati titik ini
+            if index < lastIndex then
+                local nextWp = waypoints[index + 1]
+                local dNext = flatDist(pos, nextWp.Position)
+                if nextWp.Action ~= Enum.PathWaypointAction.Jump
+                    and dNext < 3.2
+                    and dNext < flatDist(pos, waypoint.Position)
+                    and math.abs(pos.Y - nextWp.Position.Y) < 7 then
+                    index += 1
+                    break
+                end
             end
 
             -- Monster mendekat ke rute di depan: berhenti & hitung ulang rute
@@ -1482,7 +1516,11 @@ local function followPathInner(waypoints, myChar, hum, root, deadline)
             end
             if stalled > STUCK_TIME or now - startedAt > WAYPOINT_TIMEOUT then
                 -- tersangkut tepat di ujung rute (mis. terhalang ore itu sendiri) = sudah sedekat mungkin
-                return index == lastIndex and "done" or "stuck"
+                -- atau sudah hampir dalam jangkauan tujuan = anggap sampai
+                if index == lastIndex or (goal and goalNear and (pos - goal).Magnitude <= goalNear + 3) then
+                    return "done"
+                end
+                return "stuck"
             end
 
             local aim = waypoint.Position
@@ -1502,8 +1540,8 @@ local function followPathInner(waypoints, myChar, hum, root, deadline)
 end
 
 -- Pembungkus: pastikan semua tombol WASD dilepas begitu selesai / gagal / dihentikan
-local function followPath(waypoints, myChar, hum, root, deadline)
-    local result, extra = followPathInner(waypoints, myChar, hum, root, deadline)
+local function followPath(waypoints, myChar, hum, root, deadline, goal, goalNear)
+    local result, extra = followPathInner(waypoints, myChar, hum, root, deadline, goal, goalNear)
     releaseKeys()
     return result, extra
 end
@@ -1569,7 +1607,7 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
             drawPath(route)
             setStatus(string.format("Jalan sesuai garis hijau (%d titik)", #route))
 
-            local outcome, extra = followPath(route, myChar, h2, r2, deadline)
+            local outcome, extra = followPath(route, myChar, h2, r2, deadline, targetPos, near)
             if outcome == "abort" then
                 return false
             elseif outcome == "timeout" then
@@ -1591,6 +1629,17 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
                     return false
                 end
                 setStatus(string.format("Nyangkut, hitung ulang rute (%d/%d)", repaths, MAX_REPATH))
+                -- geser sedikit ke belakang/samping supaya tidak mengulang titik macet yang sama
+                local look = r2.CFrame.LookVector
+                local flatLook = Vector3.new(look.X, 0, look.Z)
+                if flatLook.Magnitude > 0.1 then
+                    flatLook = flatLook.Unit
+                    local side = Vector3.new(-flatLook.Z, 0, flatLook.X) * ((repaths % 2 == 0) and 1 or -1)
+                    h2:MoveTo(r2.Position - flatLook * 3 + side * 3)
+                    if not waitFor(0.5) then
+                        return false
+                    end
+                end
                 task.wait(0.2)
             else -- "done": sudah berdiri di ujung rute (titik terdekat yang bisa dicapai)
                 return true
@@ -2115,6 +2164,7 @@ local function attemptMine(target, forceWalk)
     local deadline = os.clock() + MINE_CONFIRM_TIME
     local presses = 0
     local closerTries = 0
+    local walkAttempts = 0
 
     while target.ore.Parent and os.clock() < deadline do
         local state = getMineState(target)
@@ -2124,7 +2174,8 @@ local function attemptMine(target, forceWalk)
 
         character = player.Character
         rootPart = character and character:FindFirstChild("HumanoidRootPart")
-        if rootPart and oreTooFar(target, rootPart) then
+        if rootPart and oreTooFar(target, rootPart) and walkAttempts < 3 then
+            walkAttempts += 1
             if not walkToOre(target) then
                 markUnreachable(target)
                 return false
