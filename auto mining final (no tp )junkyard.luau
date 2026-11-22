@@ -1,16 +1,19 @@
 -- Auto Miner (F-only + deteksi tombol Mine / Stop Mining) + JALAN KAKI DENGAN KALKULASI RUTE
 -- Perubahan versi ini:
+--  * BARU: rute ke target (ore & drop) sekarang juga menghindari monster Kettle Beetle & Critter Goblin.
+--      - Rute yang lewat dalam jarak ROUTE_MONSTER_CLEARANCE (50 stud) dari monster DITOLAK.
+--      - Bot mencoba rute memutar lewat titik di sekeliling monster.
+--      - Kalau semua rute terhalang monster: tunggu sebentar, hitung ulang.
+--      - Saat berjalan, monster dipantau terus: kalau mendekati rute di depan -> berhenti & hitung ulang rute.
+--      - Centang di menu "MONSTER DIHINDARI" tetap berlaku (tidak dicentang = tidak dihindari di rute).
 --  * SEMUA teleport / noclip / anchor / jalan bawah tanah / meluncur menembus objek DIHAPUS.
---  * Menuju target mining (dan drop) sekarang dengan:
+--  * Menuju target mining (dan drop) dengan:
 --      1. Cari beberapa titik pijakan di sekitar target (di tanah, dalam jarak "Jarak ke ore").
 --      2. Hitung rute dengan PathfindingService (dinding tidak bisa dilewati -> otomatis cari jalan lain,
 --         gundukan kecil <= WALL_HEIGHT tetap boleh dilompati, air dihindari).
---      3. Rute DIVERIFIKASI ulang dengan raycast:
---           - ada dinding menghalang  -> rute ditolak, coba titik/jalan lain
---           - ada lubang lebih dalam dari MAX_DROP -> rute ditolak (tidak diterabas, cari jalan memutar)
+--      3. Rute DIVERIFIKASI ulang dengan raycast (dinding / lubang dalam / monster).
 --      4. Rute terbaik ditandai GARIS HIJAU, baru karakter berjalan mengikuti garis itu
 --         dengan menekan tombol WASD (relatif kamera) + Space untuk lompat, seperti main biasa.
---         Kamera diputar halus ke arah tujuan (CAMERA_FOLLOW), karakter tidak jalan mundur.
 --      5. Nyangkut -> lompat (Space) -> hitung ulang rute (maks MAX_REPATH kali).
 --      6. Kalau tidak ada rute yang bisa dicapai -> ore itu di-skip, lanjut ke target berikutnya.
 --  * Auto respawn: kalau mati, tunggu tombol Respawn aktif -> klik -> lanjut mining lagi.
@@ -68,6 +71,21 @@ local KEY_RESEND = 0.4           -- kirim ulang tombol yang sedang ditahan tiap 
 local CAMERA_FOLLOW = true      -- saat berjalan, kamera diputar halus ke arah tujuan
 local CAMERA_TURN_SPEED = 4     -- kehalusan putar kamera (makin besar = makin cepat menyusul)
 local CAMERA_MAX_TURN = 160     -- batas kecepatan putar kamera (derajat/detik)
+
+-- Hindari monster di sepanjang rute
+local ROUTE_AVOID_MONSTERS = { "Kettle Beetle", "Critter Goblin" } -- monster yang dihindari di rute
+local ROUTE_MONSTER_CLEARANCE = 50   -- rute harus menjauh minimal segini dari monster (stud)
+local ROUTE_DETOUR_EXTRA = 10        -- tambahan jarak titik belok saat memutar menghindari monster (stud)
+local MAX_DETOURS = 4                -- maks titik belok yang dicoba per target
+local MONSTER_LOOKAHEAD = 50         -- saat berjalan, cek monster pada rute sejauh ini ke depan (stud)
+local MONSTER_CHECK_INTERVAL = 0.4   -- seberapa sering cek monster saat berjalan (dtk)
+local MAX_MONSTER_REPATH = 8         -- maks hitung ulang rute karena monster mendekat
+local MONSTER_WAIT_TRIES = 3         -- kalau semua rute terhalang monster: tunggu & coba lagi sekian kali
+local MONSTER_WAIT_TIME = 2          -- lama tiap tunggu (dtk)
+local routeAvoidSet = {}
+for _, n in ipairs(ROUTE_AVOID_MONSTERS) do
+    routeAvoidSet[n] = true
+end
 
 -- Auto respawn
 local AUTO_RESPAWN = true       -- true = kalau mati, tunggu tombol Respawn aktif, klik, lalu lanjut mining
@@ -1162,12 +1180,138 @@ local function routeLength(waypoints)
     return total
 end
 
--- Hitung rute terbaik ke salah satu titik pijakan dekat target. nil = tidak ada rute valid.
+-- ===== Deteksi monster di rute =====
+local function getRouteMonsters()
+    local list = {}
+    for model, monsterName in pairs(monsterModels) do
+        if routeAvoidSet[monsterName] and avoidMonster[monsterName] and model.Parent then
+            local humanoid = model:FindFirstChildOfClass("Humanoid")
+            if not (humanoid and humanoid.Health <= 0) then
+                local ok, pivot = pcall(model.GetPivot, model)
+                if ok then
+                    table.insert(list, { name = monsterName, pos = pivot.Position })
+                end
+            end
+        end
+    end
+    return list
+end
+
+local function wpPositions(waypoints)
+    local pts = {}
+    for _, w in ipairs(waypoints) do
+        table.insert(pts, w.Position)
+    end
+    return pts
+end
+
+-- Jarak mendatar titik p ke segmen a-b (+ tinggi segmen di titik terdekat)
+local function segDistFlat(p, a, b)
+    local dx, dz = b.X - a.X, b.Z - a.Z
+    local len2 = dx * dx + dz * dz
+    local t = 0
+    if len2 > 0.0001 then
+        t = math.clamp(((p.X - a.X) * dx + (p.Z - a.Z) * dz) / len2, 0, 1)
+    end
+    local cx, cz = a.X + dx * t, a.Z + dz * t
+    local dist = math.sqrt((p.X - cx) ^ 2 + (p.Z - cz) ^ 2)
+    return dist, a.Y + (b.Y - a.Y) * t
+end
+
+-- Kembalikan monster pertama yang terlalu dekat dengan rute (nil = rute aman)
+local function routeMonsterConflict(points, monsters)
+    if #points == 0 or #monsters == 0 then
+        return nil
+    end
+    local start = points[1]
+    for _, m in ipairs(monsters) do
+        local clear = ROUTE_MONSTER_CLEARANCE
+        local startDist = flatDist(start, m.pos)
+        if startDist < clear then
+            -- monster sudah dekat dari awal: rute tidak boleh makin mendekat
+            clear = math.max(startDist * 0.8, 3)
+        end
+        for i = 1, #points do
+            local a = points[i]
+            local b = points[i + 1] or a
+            local d, cy = segDistFlat(m.pos, a, b)
+            if d < clear and math.abs(m.pos.Y - cy) < 15 then
+                return m
+            end
+        end
+    end
+    return nil
+end
+
+local function computePath(pathParams, a, b)
+    local ok, waypoints = pcall(function()
+        local path = PathfindingService:CreatePath(pathParams)
+        path:ComputeAsync(a, b)
+        if path.Status ~= Enum.PathStatus.Success then
+            return nil
+        end
+        return path:GetWaypoints()
+    end)
+    if ok and waypoints and #waypoints >= 1 then
+        return waypoints
+    end
+    return nil
+end
+
+-- Rute memutar: lewat titik di sekeliling monster yang menghalangi
+local function tryDetour(pathParams, params, fromPos, candPos, monsters, blocker)
+    local radius = ROUTE_MONSTER_CLEARANCE + ROUTE_DETOUR_EXTRA
+    local vias = {}
+    for i = 0, 7 do
+        local ang = i * math.pi / 4
+        local x = blocker.pos.X + math.cos(ang) * radius
+        local z = blocker.pos.Z + math.sin(ang) * radius
+        local hit = workspace:Raycast(Vector3.new(x, blocker.pos.Y + 6, z), Vector3.new(0, -GROUND_SCAN, 0), params)
+        if hit then
+            local g = hit.Position
+            local safe = true
+            for _, m in ipairs(monsters) do
+                if flatDist(g, m.pos) < ROUTE_MONSTER_CLEARANCE * 0.8 then
+                    safe = false
+                    break
+                end
+            end
+            if safe then
+                table.insert(vias, { pos = g, score = (g - fromPos).Magnitude + (g - candPos).Magnitude })
+            end
+        end
+    end
+    table.sort(vias, function(a, b)
+        return a.score < b.score
+    end)
+
+    for i = 1, math.min(#vias, MAX_DETOURS) do
+        local w1 = computePath(pathParams, fromPos, vias[i].pos)
+        local w2 = w1 and computePath(pathParams, vias[i].pos, candPos)
+        if w1 and w2 then
+            local joined = {}
+            for _, w in ipairs(w1) do
+                table.insert(joined, w)
+            end
+            for j = 2, #w2 do
+                table.insert(joined, w2[j])
+            end
+            if validateRoute(joined, params) and not routeMonsterConflict(wpPositions(joined), monsters) then
+                return joined
+            end
+        end
+    end
+    return nil
+end
+
+-- Hitung rute terbaik ke salah satu titik pijakan dekat target.
+-- Hasil: rute | nil, alasan, terhalangMonster
 local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack, extraRadius)
     slack = slack or 2
     local pathParams = table.clone(PATH_PARAMS)
     pathParams.AgentRadius = AGENT_RADIUS + (extraRadius or 0)
     local params = buildRayParams(ignoreInstance)
+    local monsters = getRouteMonsters()
     local candidates = buildCandidates(targetPos, reach, fromPos, params, slack)
     if #candidates == 0 then
         -- tidak ada pijakan sedekat itu: longgarkan sedikit, ambil yang terdekat
@@ -1180,35 +1324,47 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack, ex
     local best, bestLength = nil, math.huge
     local rawBest, rawBestLength = nil, math.huge
     local validCount = 0
+    local detourTries = 0
+    local monsterBlocked = nil
     local lastReason = "tidak ada jalan"
 
-    for i = 1, math.min(#candidates, MAX_CANDIDATES) do
-        local ok, waypoints = pcall(function()
-            local path = PathfindingService:CreatePath(pathParams)
-            path:ComputeAsync(fromPos, candidates[i].pos)
-            if path.Status ~= Enum.PathStatus.Success then
-                return nil
-            end
-            return path:GetWaypoints()
-        end)
+    local function accept(route)
+        local length = routeLength(route)
+        if length < bestLength then
+            best, bestLength = route, length
+        end
+        validCount += 1
+    end
 
-        if ok and waypoints and #waypoints >= 1 then
+    for i = 1, math.min(#candidates, MAX_CANDIDATES) do
+        local waypoints = computePath(pathParams, fromPos, candidates[i].pos)
+        if waypoints then
             local valid, reason = validateRoute(waypoints, params)
             if valid then
-                local length = routeLength(waypoints)
-                if length < bestLength then
-                    best, bestLength = waypoints, length
+                local blocker = routeMonsterConflict(wpPositions(waypoints), monsters)
+                if not blocker then
+                    accept(waypoints)
+                else
+                    monsterBlocked = blocker.name
+                    lastReason = "monster " .. blocker.name .. " di rute"
+                    if detourTries < 2 then
+                        detourTries += 1
+                        local detour = tryDetour(pathParams, params, fromPos, candidates[i].pos, monsters, blocker)
+                        if detour then
+                            accept(detour)
+                        end
+                    end
                 end
-                validCount += 1
                 if validCount >= 2 then
                     break
                 end
             else
                 lastReason = "rute ditolak: " .. tostring(reason)
                 -- ditolak karena dinding tapi navmesh bilang bisa: simpan sebagai cadangan
+                -- (hanya kalau tidak melewati monster)
                 if reason == "dinding" then
                     local length = routeLength(waypoints)
-                    if length < rawBestLength then
+                    if length < rawBestLength and not routeMonsterConflict(wpPositions(waypoints), monsters) then
                         rawBest, rawBestLength = waypoints, length
                     end
                 end
@@ -1220,16 +1376,20 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack, ex
         best = rawBest
     end
     if not best then
+        if monsterBlocked then
+            return nil, "monster " .. monsterBlocked .. " menghalangi rute", true
+        end
         return nil, lastReason
     end
     return best
 end
 
--- Ikuti rute dengan berjalan biasa. Hasil: "done" | "stuck" | "abort" | "timeout"
+-- Ikuti rute dengan berjalan biasa. Hasil: "done" | "stuck" | "abort" | "timeout" | "monster"
 local function followPathInner(waypoints, myChar, hum, root, deadline)
     local lastIndex = #waypoints
     local index = 2
     local sideSign = 1
+    local lastMonsterCheck = 0
 
     while index <= lastIndex do
         local waypoint = waypoints[index]
@@ -1259,6 +1419,29 @@ local function followPathInner(waypoints, myChar, hum, root, deadline)
             local arriveRadius = (index == lastIndex) and FINAL_ARRIVE_RADIUS or 3.2
             if flatDist(pos, waypoint.Position) < arriveRadius and math.abs(pos.Y - waypoint.Position.Y) < 7 then
                 break
+            end
+
+            -- Monster mendekat ke rute di depan: berhenti & hitung ulang rute
+            if now - lastMonsterCheck >= MONSTER_CHECK_INTERVAL then
+                lastMonsterCheck = now
+                local monsters = getRouteMonsters()
+                if #monsters > 0 then
+                    local pts = { pos }
+                    local travelled, prev = 0, pos
+                    for k = index, lastIndex do
+                        local p = waypoints[k].Position
+                        travelled += (p - prev).Magnitude
+                        table.insert(pts, p)
+                        prev = p
+                        if travelled >= MONSTER_LOOKAHEAD then
+                            break
+                        end
+                    end
+                    local conflict = routeMonsterConflict(pts, monsters)
+                    if conflict then
+                        return "monster", conflict.name
+                    end
+                end
             end
 
             -- Kemajuan diukur MENDATAR saja: lompat di tempat (naik-turun) tidak dihitung maju,
@@ -1314,9 +1497,9 @@ end
 
 -- Pembungkus: pastikan semua tombol WASD dilepas begitu selesai / gagal / dihentikan
 local function followPath(waypoints, myChar, hum, root, deadline)
-    local result = followPathInner(waypoints, myChar, hum, root, deadline)
+    local result, extra = followPathInner(waypoints, myChar, hum, root, deadline)
     releaseKeys()
-    return result
+    return result, extra
 end
 
 -- Berjalan ke dekat targetPos (dalam jarak reach). Menunggu (yield) sampai selesai.
@@ -1341,6 +1524,8 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
     local ok, result = pcall(function()
         local deadline = os.clock() + WALK_TIMEOUT
         local repaths = 0
+        local monsterRepaths = 0
+        local monsterWaits = 0
 
         while true do
             local c2, h2, r2 = getChar()
@@ -1360,8 +1545,17 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
 
             setStatus("Menghitung rute...")
             local feet = r2.Position - Vector3.new(0, r2.Size.Y / 2 + h2.HipHeight, 0)
-            local route, reason = computeRoute(feet, targetPos, reach, ignoreInstance, tol - 1, repaths * 1.0)
+            local route, reason, monsterBlock = computeRoute(feet, targetPos, reach, ignoreInstance, tol - 1, repaths * 1.0)
             if not route then
+                if monsterBlock and monsterWaits < MONSTER_WAIT_TRIES then
+                    monsterWaits += 1
+                    setStatus(string.format("%s, tunggu monster pergi (%d/%d)",
+                        tostring(reason), monsterWaits, MONSTER_WAIT_TRIES))
+                    if not waitFor(MONSTER_WAIT_TIME) then
+                        return false
+                    end
+                    continue
+                end
                 setStatus("Tidak bisa dicapai: " .. tostring(reason))
                 return false
             end
@@ -1369,12 +1563,21 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
             drawPath(route)
             setStatus(string.format("Jalan sesuai garis hijau (%d titik)", #route))
 
-            local outcome = followPath(route, myChar, h2, r2, deadline)
+            local outcome, extra = followPath(route, myChar, h2, r2, deadline)
             if outcome == "abort" then
                 return false
             elseif outcome == "timeout" then
                 setStatus("Waktu jalan habis")
                 return false
+            elseif outcome == "monster" then
+                monsterRepaths += 1
+                if monsterRepaths > MAX_MONSTER_REPATH then
+                    setStatus("Monster terus menghalangi rute, target dilewati")
+                    return false
+                end
+                setStatus(string.format("%s mendekati rute, hitung ulang (%d/%d)",
+                    tostring(extra), monsterRepaths, MAX_MONSTER_REPATH))
+                task.wait(0.2)
             elseif outcome == "stuck" then
                 repaths += 1
                 if repaths > MAX_REPATH then
