@@ -89,6 +89,8 @@ local CAMERA_MAX_TURN = 160     -- batas kecepatan putar kamera (derajat/detik)
 local AUTO_JUMP_OBSTACLE = true     -- true = lompat kalau ada halangan rendah di depan
 local OBSTACLE_CHECK_DIST = 3.5     -- cek halangan sejauh ini ke depan (stud)
 local OBSTACLE_MAX_HEIGHT = 5       -- halangan lebih tinggi dari ini dianggap dinding, tidak dilompati
+local JUMP_MIN_PROGRESS = 2.5         -- lompat berikutnya hanya boleh kalau sudah maju segini dari titik lompat sebelumnya (stud). Mencegah lompat di tempat
+local JUMP_PROGRESS_WINDOW = 4        -- batas waktu aturan di atas (dtk). Lewat ini, lompat boleh lagi
 
 -- Hindari monster di sepanjang rute
 local ROUTE_AVOID_MONSTERS = { "Kettle Beetle", "Critter Goblin" } -- monster yang dihindari di rute
@@ -1008,6 +1010,21 @@ local function tapJump()
     return true
 end
 
+-- Lompat HANYA kalau karakter sedang/akan bergerak maju: kalau lompat sebelumnya tidak membuat
+-- karakter maju minimal JUMP_MIN_PROGRESS stud, lompat berikutnya ditolak (tidak lompat di tempat).
+local lastJumpPos = nil
+local function jumpMoving(pos)
+    if lastJumpPos and os.clock() - lastJumpAt < JUMP_PROGRESS_WINDOW
+        and flatDist(pos, lastJumpPos) < JUMP_MIN_PROGRESS then
+        return false
+    end
+    if tapJump() then
+        lastJumpPos = pos
+        return true
+    end
+    return false
+end
+
 -- Tekan kombinasi WASD supaya karakter bergerak menuju targetPos
 local function steerTo(targetPos, hum, root)
     local camera = workspace.CurrentCamera
@@ -1426,18 +1443,20 @@ local function computeRoute(fromPos, targetPos, reach, ignoreInstance, slack, ex
 end
 
 -- Ikuti rute dengan berjalan biasa. Hasil: "done" | "stuck" | "abort" | "timeout" | "monster"
-local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goalNear)
+local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goalNear, ignoreInstance)
     local lastIndex = #waypoints
     local index = 2
     local sideSign = 1
     local lastMonsterCheck = 0
     local obstacleParams = nil
     local obstacleParamsAt = 0
+    local obstacleJumps = 0        -- lompat halangan beruntun tanpa kemajuan
+    local obstacleBlockedUntil = 0 -- sampai kapan lompat halangan dimatikan sementara
 
     while index <= lastIndex do
         local waypoint = waypoints[index]
         if waypoint.Action == Enum.PathWaypointAction.Jump then
-            tapJump()
+            jumpMoving(root.Position)
         end
 
         local startedAt = os.clock()
@@ -1516,6 +1535,7 @@ local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goa
                 lastMoveAt = now
                 stallStage = 0
                 sideUntil = 0
+                obstacleJumps = 0
             end
             local stalled = now - lastMoveAt
 
@@ -1532,10 +1552,10 @@ local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goa
             --   1) lompat sambil maju  2) lompat + geser serong ke samping  3) hitung ulang rute
             if stallStage == 0 and stalled > 0.6 then
                 stallStage = 1
-                tapJump()
+                jumpMoving(pos)
             elseif stallStage == 1 and stalled > 1.3 then
                 stallStage = 2
-                tapJump()
+                jumpMoving(pos)
                 sideSign = -sideSign
                 sideUntil = now + 0.9
             end
@@ -1558,23 +1578,38 @@ local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goa
             end
 
             -- Halangan di depan: lompat sambil tetap maju (tombol W tidak dilepas)
-            if AUTO_JUMP_OBSTACLE and flatDist(pos, waypoint.Position) > 2.5 then
+            -- Hanya lompat kalau halangannya benar-benar tegak (bukan tanjakan/lereng), bukan ore target,
+            -- dan berhenti melompat sementara kalau sudah beberapa kali lompat tapi tidak maju.
+            if AUTO_JUMP_OBSTACLE and now >= obstacleBlockedUntil
+                and flatDist(pos, waypoint.Position) > 2.5 then
                 if not obstacleParams or now - obstacleParamsAt > 1.5 then
-                    obstacleParams = buildRayParams(nil)
+                    obstacleParams = buildRayParams(ignoreInstance)
                     obstacleParamsAt = now
                 end
                 local dirFlat = Vector3.new(aim.X - pos.X, 0, aim.Z - pos.Z)
                 if dirFlat.Magnitude > 0.1 then
                     dirFlat = dirFlat.Unit
                     local feetY = pos.Y - (root.Size.Y / 2 + hum.HipHeight)
-                    local lowOrigin = Vector3.new(pos.X, feetY + 0.7, pos.Z)
+                    local lowOrigin = Vector3.new(pos.X, feetY + 1.2, pos.Z)
                     local highOrigin = Vector3.new(pos.X, feetY + OBSTACLE_MAX_HEIGHT + 0.5, pos.Z)
                     local ray = dirFlat * OBSTACLE_CHECK_DIST
                     local lowHit = workspace:Raycast(lowOrigin, ray, obstacleParams)
-                    local highHit = workspace:Raycast(highOrigin, ray, obstacleParams)
-                    -- ada halangan rendah, bagian atasnya kosong = bisa dilompati
-                    if lowHit and not highHit then
-                        tapJump()
+                    -- permukaan landai (lereng) = bisa dijalani, bukan halangan
+                    if lowHit and lowHit.Normal.Y < 0.5 then
+                        local highHit = workspace:Raycast(highOrigin, ray, obstacleParams)
+                        -- hanya lompat kalau karakter menghadap arah tujuan (jadi W benar-benar maju)
+                        -- dan bukan di dekat target (halangannya biasanya ore itu sendiri)
+                        local lookFlat = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+                        local facing = lookFlat.Magnitude > 0.1 and lookFlat.Unit:Dot(dirFlat) > 0.6
+                        local nearGoal = goal and goalNear and (pos - goal).Magnitude <= goalNear + 6
+                        if not highHit and facing and not nearGoal and jumpMoving(pos) then
+                            obstacleJumps += 1
+                            if obstacleJumps >= 3 then
+                                -- 3x lompat tidak maju: jangan lompat-lompat di tempat, serahkan ke anti-nyangkut
+                                obstacleJumps = 0
+                                obstacleBlockedUntil = now + 4
+                            end
+                        end
                     end
                 end
             end
@@ -1588,8 +1623,8 @@ local function followPathInner(waypoints, myChar, hum, root, deadline, goal, goa
 end
 
 -- Pembungkus: pastikan semua tombol WASD dilepas begitu selesai / gagal / dihentikan
-local function followPath(waypoints, myChar, hum, root, deadline, goal, goalNear)
-    local result, extra = followPathInner(waypoints, myChar, hum, root, deadline, goal, goalNear)
+local function followPath(waypoints, myChar, hum, root, deadline, goal, goalNear, ignoreInstance)
+    local result, extra = followPathInner(waypoints, myChar, hum, root, deadline, goal, goalNear, ignoreInstance)
     releaseKeys()
     return result, extra
 end
@@ -1763,7 +1798,7 @@ local function walkTo(targetPos, reach, ignoreInstance, tolerance)
             drawPath(route)
             setStatus(string.format("Jalan sesuai garis hijau (%d titik)", #route))
 
-            local outcome, extra = followPath(route, myChar, h2, r2, deadline, targetPos, near)
+            local outcome, extra = followPath(route, myChar, h2, r2, deadline, targetPos, near, ignoreInstance)
             if outcome == "abort" then
                 return false
             elseif outcome == "timeout" then
