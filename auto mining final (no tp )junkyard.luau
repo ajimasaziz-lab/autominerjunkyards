@@ -28,6 +28,7 @@
 --      6. Kalau tidak ada rute yang bisa dicapai -> ore itu di-skip, lanjut ke target berikutnya.
 --  * Auto respawn: kalau mati, tunggu tombol Respawn aktif -> klik -> lanjut mining lagi.
 --  * Bertahan saat disconnect: pengaturan disimpan ke file, auto START lagi, auto rejoin + muat ulang script.
+-- Tombol RESET HITUNGAN = nol-kan hitungan item (Gold Veined Quartz)
 -- Tombol UI atau 0 = start/stop | X = mark + skip SP ini | End = matikan script
 
 local Players = game:GetService("Players")
@@ -390,6 +391,7 @@ Instance.new("UIPadding", inputIgnore).PaddingLeft = UDim.new(0, 8)
 local toggleButton = createButton("START", THEME.green, 26)
 local markButton = createButton("MARK + SKIP (X)", THEME.orange, 22)
 local monsterButton = createButton("MONSTER DIHINDARI >", THEME.blue, 22)
+local resetButton = createButton("RESET HITUNGAN", THEME.grey, 22)
 
 -- Popup menu centang monster
 local POPUP_WIDTH = 170
@@ -570,6 +572,14 @@ local function updateStats()
     end
 end
 updateStats()
+
+-- Tombol reset hitungan item (COUNT_ITEM_NAME). Jumlah ore & drop tidak diubah.
+table.insert(connections, resetButton.Activated:Connect(function()
+    gvqCount = 0
+    updateStats()
+    saveState()
+    setStatus(COUNT_ITEM_NAME .. " direset ke 0")
+end))
 
 -- Drag window lewat header (mouse & touch)
 do
